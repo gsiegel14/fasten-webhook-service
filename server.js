@@ -12,6 +12,8 @@ const PORT = process.env.PORT || 8080;
 const webhookEvents = new Map();
 const connectionExports = new Map(); // org_connection_id -> export data
 const connectionStatus = new Map(); // org_connection_id -> connection info
+const userConnections = new Map(); // external_id -> Set<org_connection_id>
+const userExports = new Map(); // external_id -> Map<org_connection_id, export_data>
 
 // Middleware
 app.use(helmet());
@@ -86,7 +88,9 @@ app.get('/health', (req, res) => {
     stats: {
       totalEvents: webhookEvents.size,
       connections: connectionStatus.size,
-      exports: connectionExports.size
+      exports: connectionExports.size,
+      uniqueUsers: userConnections.size,
+      userExports: userExports.size
     }
   });
 });
@@ -137,6 +141,95 @@ app.get('/api/connections', (req, res) => {
   }));
   
   res.json({ connections });
+});
+
+// API endpoint for iOS app to get all connections for a user (by external_id)
+app.get('/api/users/:externalId/connections', (req, res) => {
+  const { externalId } = req.params;
+  const userOrgIds = userConnections.get(externalId);
+  
+  if (!userOrgIds || userOrgIds.size === 0) {
+    return res.json({
+      externalId,
+      connections: []
+    });
+  }
+  
+  const connections = Array.from(userOrgIds).map(orgId => {
+    const connection = connectionStatus.get(orgId);
+    return {
+      orgConnectionId: orgId,
+      ...connection,
+      hasExport: connectionExports.has(orgId)
+    };
+  }).filter(Boolean);
+  
+  res.json({
+    externalId,
+    connections
+  });
+});
+
+// API endpoint for iOS app to get all exports for a user (by external_id)
+app.get('/api/users/:externalId/exports', (req, res) => {
+  const { externalId } = req.params;
+  const userExportMap = userExports.get(externalId);
+  
+  if (!userExportMap || userExportMap.size === 0) {
+    return res.json({
+      externalId,
+      exports: []
+    });
+  }
+  
+  const exports = Array.from(userExportMap.entries()).map(([orgId, exportData]) => ({
+    orgConnectionId: orgId,
+    ...exportData
+  }));
+  
+  res.json({
+    externalId,
+    exports
+  });
+});
+
+// API endpoint to get user summary (connections + exports)
+app.get('/api/users/:externalId/summary', (req, res) => {
+  const { externalId } = req.params;
+  const userOrgIds = userConnections.get(externalId);
+  const userExportMap = userExports.get(externalId);
+  
+  if (!userOrgIds || userOrgIds.size === 0) {
+    return res.json({
+      externalId,
+      totalConnections: 0,
+      totalExports: 0,
+      connections: [],
+      exports: []
+    });
+  }
+  
+  const connections = Array.from(userOrgIds).map(orgId => {
+    const connection = connectionStatus.get(orgId);
+    return {
+      orgConnectionId: orgId,
+      ...connection,
+      hasExport: connectionExports.has(orgId)
+    };
+  }).filter(Boolean);
+  
+  const exports = userExportMap ? Array.from(userExportMap.entries()).map(([orgId, exportData]) => ({
+    orgConnectionId: orgId,
+    ...exportData
+  })) : [];
+  
+  res.json({
+    externalId,
+    totalConnections: connections.length,
+    totalExports: exports.length,
+    connections,
+    exports
+  });
 });
 
 // Main webhook endpoint for Fasten Connect
@@ -228,8 +321,7 @@ function handleExportSuccess(data, timestamp) {
   console.log(`📊 Stats:`, stats);
   console.log(`📥 Download link: ${download_link}`);
   
-  // Store export data for iOS app to retrieve
-  connectionExports.set(org_connection_id, {
+  const exportData = {
     status: 'success',
     downloadLink: download_link,
     stats: stats || {},
@@ -237,13 +329,25 @@ function handleExportSuccess(data, timestamp) {
     orgId: org_id,
     timestamp,
     expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() // 24 hours
-  });
+  };
+  
+  // Store export data for iOS app to retrieve
+  connectionExports.set(org_connection_id, exportData);
   
   // Update connection status
   if (connectionStatus.has(org_connection_id)) {
     const connection = connectionStatus.get(org_connection_id);
     connection.lastExportSuccess = timestamp;
     connection.exportStatus = 'success';
+    
+    // Update user-centric export tracking
+    if (connection.externalId) {
+      if (!userExports.has(connection.externalId)) {
+        userExports.set(connection.externalId, new Map());
+      }
+      userExports.get(connection.externalId).set(org_connection_id, exportData);
+      console.log(`📋 Updated exports for user: ${connection.externalId}`);
+    }
   }
   
   // TODO: In production, you would:
@@ -259,14 +363,16 @@ function handleExportFailed(data, timestamp) {
   console.log(`❌ Export Failed for connection: ${org_connection_id}`);
   console.log(`💥 Failure reason: ${failure_reason}`);
   
-  // Store failure data
-  connectionExports.set(org_connection_id, {
+  const exportData = {
     status: 'failed',
     failureReason: failure_reason,
     taskId: task_id,
     orgId: org_id,
     timestamp
-  });
+  };
+  
+  // Store failure data
+  connectionExports.set(org_connection_id, exportData);
   
   // Update connection status
   if (connectionStatus.has(org_connection_id)) {
@@ -274,6 +380,15 @@ function handleExportFailed(data, timestamp) {
     connection.lastExportFailure = timestamp;
     connection.exportStatus = 'failed';
     connection.failureReason = failure_reason;
+    
+    // Update user-centric export tracking
+    if (connection.externalId) {
+      if (!userExports.has(connection.externalId)) {
+        userExports.set(connection.externalId, new Map());
+      }
+      userExports.get(connection.externalId).set(org_connection_id, exportData);
+      console.log(`📋 Updated failed export for user: ${connection.externalId}`);
+    }
   }
 }
 
@@ -293,7 +408,7 @@ function handleConnectionSuccess(data, timestamp) {
   console.log(`👤 External ID: ${external_id || 'none'}`);
   
   // Store connection data
-  connectionStatus.set(org_connection_id, {
+  const connectionData = {
     endpointId: endpoint_id,
     brandId: brand_id,
     portalId: portal_id,
@@ -302,7 +417,19 @@ function handleConnectionSuccess(data, timestamp) {
     externalId: external_id,
     connectedAt: timestamp,
     exportStatus: 'pending'
-  });
+  };
+  
+  connectionStatus.set(org_connection_id, connectionData);
+  
+  // Update user-centric connection tracking
+  if (external_id) {
+    if (!userConnections.has(external_id)) {
+      userConnections.set(external_id, new Set());
+    }
+    userConnections.get(external_id).add(org_connection_id);
+    console.log(`👥 Added connection ${org_connection_id} to user: ${external_id}`);
+    console.log(`👥 User ${external_id} now has ${userConnections.get(external_id).size} connection(s)`);
+  }
 }
 
 function handleAuthorizationRevoked(data, timestamp) {
@@ -313,8 +440,31 @@ function handleAuthorizationRevoked(data, timestamp) {
   // Update connection status
   if (connectionStatus.has(org_connection_id)) {
     const connection = connectionStatus.get(org_connection_id);
+    const externalId = connection.externalId;
+    
     connection.connectionStatus = connection_status;
     connection.revokedAt = timestamp;
+    
+    // Clean up user-centric tracking
+    if (externalId) {
+      // Remove from user connections
+      if (userConnections.has(externalId)) {
+        userConnections.get(externalId).delete(org_connection_id);
+        if (userConnections.get(externalId).size === 0) {
+          userConnections.delete(externalId);
+        }
+        console.log(`👥 Removed connection ${org_connection_id} from user: ${externalId}`);
+      }
+      
+      // Remove from user exports
+      if (userExports.has(externalId)) {
+        userExports.get(externalId).delete(org_connection_id);
+        if (userExports.get(externalId).size === 0) {
+          userExports.delete(externalId);
+        }
+        console.log(`📋 Removed export data for user: ${externalId}`);
+      }
+    }
   }
   
   // Remove export data since connection is revoked
