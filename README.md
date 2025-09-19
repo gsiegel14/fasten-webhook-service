@@ -64,3 +64,4 @@ Currently, the service logs all incoming webhook events. In production, you shou
 ## Integration with Atlas iOS
 
 The iOS app doesn't need any changes - it will continue to use the existing Fasten Connect flow. This webhook service operates independently and receives events when users complete actions in Fasten.
+

@@ -1,15 +1,30 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const crypto = require('crypto');
+const fs = require('fs').promises;
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+
+// In-memory storage for webhook events (in production, use a database)
+const webhookEvents = new Map();
+const connectionExports = new Map(); // org_connection_id -> export data
+const connectionStatus = new Map(); // org_connection_id -> connection info
 
 // Middleware
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Raw body middleware for webhook signature verification
+app.use('/webhook/fasten', express.raw({ type: 'application/json' }), (req, res, next) => {
+  req.rawBody = req.body;
+  req.body = JSON.parse(req.body.toString());
+  next();
+});
 
 // Logging middleware
 app.use((req, res, next) => {
@@ -18,48 +33,297 @@ app.use((req, res, next) => {
   next();
 });
 
+// Webhook signature verification (Standard Webhooks format)
+function verifyWebhookSignature(body, signature, secret) {
+  if (!signature || !secret) {
+    return false; // Skip verification if no signature or secret
+  }
+  
+  try {
+    const parts = signature.split(',').map(part => part.trim());
+    let timestamp = null;
+    let signatures = [];
+    
+    for (const part of parts) {
+      const [key, value] = part.split('=', 2);
+      if (key === 't') {
+        timestamp = parseInt(value);
+      } else if (key === 'v1') {
+        signatures.push(value);
+      }
+    }
+    
+    if (!timestamp || signatures.length === 0) {
+      return false;
+    }
+    
+    // Check timestamp (within 5 minutes)
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - timestamp) > 300) {
+      return false;
+    }
+    
+    // Verify signature
+    const payload = `${timestamp}.${body}`;
+    const expectedSignature = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+    
+    return signatures.some(sig => crypto.timingSafeEqual(
+      Buffer.from(expectedSignature, 'hex'),
+      Buffer.from(sig, 'hex')
+    ));
+  } catch (error) {
+    console.error('Webhook signature verification error:', error);
+    return false;
+  }
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
     timestamp: new Date().toISOString(),
-    service: 'fasten-webhook-service'
+    service: 'fasten-webhook-service',
+    stats: {
+      totalEvents: webhookEvents.size,
+      connections: connectionStatus.size,
+      exports: connectionExports.size
+    }
   });
+});
+
+// API endpoint for iOS app to get connection status
+app.get('/api/connections/:orgConnectionId/status', (req, res) => {
+  const { orgConnectionId } = req.params;
+  const connection = connectionStatus.get(orgConnectionId);
+  
+  if (!connection) {
+    return res.status(404).json({
+      error: 'Connection not found',
+      orgConnectionId
+    });
+  }
+  
+  res.json({
+    orgConnectionId,
+    ...connection,
+    hasExport: connectionExports.has(orgConnectionId)
+  });
+});
+
+// API endpoint for iOS app to get export data
+app.get('/api/connections/:orgConnectionId/exports', (req, res) => {
+  const { orgConnectionId } = req.params;
+  const exportData = connectionExports.get(orgConnectionId);
+  
+  if (!exportData) {
+    return res.status(404).json({
+      error: 'Export not found',
+      orgConnectionId
+    });
+  }
+  
+  res.json({
+    orgConnectionId,
+    ...exportData
+  });
+});
+
+// API endpoint to list all connections for debugging
+app.get('/api/connections', (req, res) => {
+  const connections = Array.from(connectionStatus.entries()).map(([id, data]) => ({
+    orgConnectionId: id,
+    ...data,
+    hasExport: connectionExports.has(id)
+  }));
+  
+  res.json({ connections });
 });
 
 // Main webhook endpoint for Fasten Connect
 app.post('/webhook/fasten', (req, res) => {
   const timestamp = new Date().toISOString();
+  const eventId = crypto.randomUUID();
   
   console.log(`\n=== Fasten Webhook Event Received (${timestamp}) ===`);
+  console.log('Event ID:', eventId);
   console.log('Headers:', JSON.stringify(req.headers, null, 2));
   console.log('Body:', JSON.stringify(req.body, null, 2));
-  console.log('=== End Webhook Event ===\n');
   
-  // Extract useful information from the webhook
-  const { event_type, patient_id, resource_type, resource_id } = req.body;
+  // Verify webhook signature if secret is provided
+  const signature = req.headers['webhook-signature'];
+  const secret = process.env.FASTEN_WEBHOOK_SECRET;
   
-  // Log structured event data
-  if (event_type) {
-    console.log(`Event Type: ${event_type}`);
-    if (patient_id) console.log(`Patient ID: ${patient_id}`);
-    if (resource_type) console.log(`Resource Type: ${resource_type}`);
-    if (resource_id) console.log(`Resource ID: ${resource_id}`);
+  if (secret && !verifyWebhookSignature(req.rawBody.toString(), signature, secret)) {
+    console.log('❌ Webhook signature verification failed');
+    return res.status(401).json({ error: 'Invalid signature' });
   }
   
-  // TODO: In production, you would:
-  // 1. Validate the webhook signature (if Fasten provides one)
-  // 2. Store the event in a database
-  // 3. Trigger any business logic (notifications, sync, etc.)
-  // 4. Forward to your main backend if needed
+  // Store the raw event
+  const event = {
+    id: eventId,
+    timestamp,
+    headers: req.headers,
+    body: req.body,
+    processed: false
+  };
+  
+  webhookEvents.set(eventId, event);
+  
+  // Process different event types
+  try {
+    processWebhookEvent(req.body, timestamp);
+    event.processed = true;
+  } catch (error) {
+    console.error('Error processing webhook event:', error);
+    event.error = error.message;
+  }
+  
+  console.log('=== End Webhook Event ===\n');
   
   // Respond with 200 OK to acknowledge receipt
   res.status(200).json({ 
     received: true, 
+    eventId,
     timestamp,
     message: 'Webhook event processed successfully'
   });
 });
+
+// Process webhook events based on type
+function processWebhookEvent(body, timestamp) {
+  const { type, data, api_mode, id } = body;
+  
+  console.log(`📋 Processing event: ${type} (${api_mode || 'unknown mode'})`);
+  
+  switch (type) {
+    case 'patient.ehi_export_success':
+      handleExportSuccess(data, timestamp);
+      break;
+      
+    case 'patient.ehi_export_failed':
+      handleExportFailed(data, timestamp);
+      break;
+      
+    case 'patient.connection_success':
+      handleConnectionSuccess(data, timestamp);
+      break;
+      
+    case 'patient.authorization_revoked':
+      handleAuthorizationRevoked(data, timestamp);
+      break;
+      
+    case 'webhook.test':
+      handleWebhookTest(data, timestamp);
+      break;
+      
+    default:
+      console.log(`⚠️ Unknown event type: ${type}`);
+  }
+}
+
+function handleExportSuccess(data, timestamp) {
+  const { org_connection_id, download_link, stats, task_id, org_id } = data;
+  
+  console.log(`✅ Export Success for connection: ${org_connection_id}`);
+  console.log(`📊 Stats:`, stats);
+  console.log(`📥 Download link: ${download_link}`);
+  
+  // Store export data for iOS app to retrieve
+  connectionExports.set(org_connection_id, {
+    status: 'success',
+    downloadLink: download_link,
+    stats: stats || {},
+    taskId: task_id,
+    orgId: org_id,
+    timestamp,
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() // 24 hours
+  });
+  
+  // Update connection status
+  if (connectionStatus.has(org_connection_id)) {
+    const connection = connectionStatus.get(org_connection_id);
+    connection.lastExportSuccess = timestamp;
+    connection.exportStatus = 'success';
+  }
+  
+  // TODO: In production, you would:
+  // 1. Download the JSONL file from download_link
+  // 2. Parse and store the FHIR data
+  // 3. Send push notification to iOS app
+  // 4. Update your database
+}
+
+function handleExportFailed(data, timestamp) {
+  const { org_connection_id, failure_reason, task_id, org_id } = data;
+  
+  console.log(`❌ Export Failed for connection: ${org_connection_id}`);
+  console.log(`💥 Failure reason: ${failure_reason}`);
+  
+  // Store failure data
+  connectionExports.set(org_connection_id, {
+    status: 'failed',
+    failureReason: failure_reason,
+    taskId: task_id,
+    orgId: org_id,
+    timestamp
+  });
+  
+  // Update connection status
+  if (connectionStatus.has(org_connection_id)) {
+    const connection = connectionStatus.get(org_connection_id);
+    connection.lastExportFailure = timestamp;
+    connection.exportStatus = 'failed';
+    connection.failureReason = failure_reason;
+  }
+}
+
+function handleConnectionSuccess(data, timestamp) {
+  const { 
+    org_connection_id, 
+    endpoint_id, 
+    brand_id, 
+    portal_id, 
+    connection_status, 
+    platform_type,
+    external_id 
+  } = data;
+  
+  console.log(`🔗 Connection Success: ${org_connection_id}`);
+  console.log(`🏥 Platform: ${platform_type}`);
+  console.log(`👤 External ID: ${external_id || 'none'}`);
+  
+  // Store connection data
+  connectionStatus.set(org_connection_id, {
+    endpointId: endpoint_id,
+    brandId: brand_id,
+    portalId: portal_id,
+    connectionStatus: connection_status,
+    platformType: platform_type,
+    externalId: external_id,
+    connectedAt: timestamp,
+    exportStatus: 'pending'
+  });
+}
+
+function handleAuthorizationRevoked(data, timestamp) {
+  const { org_connection_id, connection_status } = data;
+  
+  console.log(`🚫 Authorization Revoked: ${org_connection_id}`);
+  
+  // Update connection status
+  if (connectionStatus.has(org_connection_id)) {
+    const connection = connectionStatus.get(org_connection_id);
+    connection.connectionStatus = connection_status;
+    connection.revokedAt = timestamp;
+  }
+  
+  // Remove export data since connection is revoked
+  connectionExports.delete(org_connection_id);
+}
+
+function handleWebhookTest(data, timestamp) {
+  console.log(`🧪 Webhook Test:`, data);
+}
 
 // Generic webhook endpoint for testing
 app.post('/webhook/test', (req, res) => {
@@ -130,3 +394,4 @@ process.on('SIGINT', () => {
   console.log('SIGINT received, shutting down gracefully');
   process.exit(0);
 });
+
