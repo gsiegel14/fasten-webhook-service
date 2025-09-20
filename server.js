@@ -242,7 +242,7 @@ app.get('/api/users/:externalId/summary', (req, res) => {
 });
 
 // Main webhook endpoint for Fasten Connect
-app.post('/webhook/fasten', (req, res) => {
+app.post('/webhook/fasten', async (req, res) => {
   const timestamp = new Date().toISOString();
   const eventId = crypto.randomUUID();
   
@@ -273,7 +273,7 @@ app.post('/webhook/fasten', (req, res) => {
   
   // Process different event types
   try {
-    processWebhookEvent(req.body, timestamp);
+    await processWebhookEvent(req.body, timestamp);
     event.processed = true;
   } catch (error) {
     console.error('Error processing webhook event:', error);
@@ -292,14 +292,14 @@ app.post('/webhook/fasten', (req, res) => {
 });
 
 // Process webhook events based on type
-function processWebhookEvent(body, timestamp) {
+async function processWebhookEvent(body, timestamp) {
   const { type, data, api_mode, id } = body;
   
   console.log(`📋 Processing event: ${type} (${api_mode || 'unknown mode'})`);
   
   switch (type) {
     case 'patient.ehi_export_success':
-      handleExportSuccess(data, timestamp);
+      await handleExportSuccess(data, timestamp);
       break;
       
     case 'patient.ehi_export_failed':
@@ -323,7 +323,7 @@ function processWebhookEvent(body, timestamp) {
   }
 }
 
-function handleExportSuccess(data, timestamp) {
+async function handleExportSuccess(data, timestamp) {
   const { org_connection_id, download_link, stats, task_id, org_id } = data;
   
   console.log(`✅ Export Success for connection: ${org_connection_id}`);
