@@ -367,12 +367,13 @@ async function handleExportSuccess(data, timestamp) {
   
   // Process FHIR data for Foundry ingestion
   try {
+    const connection = connectionStatus.get(org_connection_id);
     if (connection && connection.externalId) {
       console.log(`🔄 Processing FHIR data for Foundry ingestion...`);
       await downloadAndProcessFHIR(download_link, org_connection_id, connection.externalId);
       console.log(`✅ FHIR data processed and ready for Foundry ingestion`);
     } else {
-      console.log(`⚠️ No external_id found for connection, skipping Foundry processing`);
+      console.log(`⚠️ No external_id found for connection ${org_connection_id}, skipping Foundry processing`);
     }
   } catch (error) {
     console.error('❌ Failed to process FHIR data for Foundry:', error);
