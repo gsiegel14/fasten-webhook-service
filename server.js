@@ -5,6 +5,15 @@ const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
 
+// Import Foundry integration
+const {
+  downloadAndProcessFHIR,
+  getAllFoundryData,
+  getFoundryDataForUser,
+  clearProcessedData,
+  getIngestionStats
+} = require('./foundry-integration');
+
 const app = express();
 const PORT = process.env.PORT || 8080;
 
@@ -350,11 +359,18 @@ function handleExportSuccess(data, timestamp) {
     }
   }
   
-  // TODO: In production, you would:
-  // 1. Download the JSONL file from download_link
-  // 2. Parse and store the FHIR data
-  // 3. Send push notification to iOS app
-  // 4. Update your database
+  // Process FHIR data for Foundry ingestion
+  try {
+    if (connection && connection.externalId) {
+      console.log(`🔄 Processing FHIR data for Foundry ingestion...`);
+      await downloadAndProcessFHIR(download_link, org_connection_id, connection.externalId);
+      console.log(`✅ FHIR data processed and ready for Foundry ingestion`);
+    } else {
+      console.log(`⚠️ No external_id found for connection, skipping Foundry processing`);
+    }
+  } catch (error) {
+    console.error('❌ Failed to process FHIR data for Foundry:', error);
+  }
 }
 
 function handleExportFailed(data, timestamp) {
@@ -489,6 +505,76 @@ app.post('/webhook/test', (req, res) => {
     timestamp,
     message: 'Test webhook received successfully'
   });
+});
+
+// Foundry Data Connection Endpoints
+// This endpoint is called BY Foundry to pull processed FHIR data
+app.get('/api/foundry/data', (req, res) => {
+  try {
+    const allData = getAllFoundryData();
+    console.log(`📤 Foundry data request: returning ${allData.length} records`);
+    
+    res.json({
+      data: allData,
+      metadata: {
+        total_records: allData.length,
+        timestamp: new Date().toISOString(),
+        source: 'fasten-webhook-service'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error serving Foundry data:', error);
+    res.status(500).json({ error: 'Failed to retrieve data' });
+  }
+});
+
+// Get data for specific user (for debugging)
+app.get('/api/foundry/users/:externalId/data', (req, res) => {
+  try {
+    const { externalId } = req.params;
+    const userData = getFoundryDataForUser(externalId);
+    
+    res.json({
+      external_id: externalId,
+      data: userData,
+      metadata: {
+        total_records: userData.length,
+        timestamp: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error serving user data:', error);
+    res.status(500).json({ error: 'Failed to retrieve user data' });
+  }
+});
+
+// Foundry ingestion statistics
+app.get('/api/foundry/stats', (req, res) => {
+  try {
+    const stats = getIngestionStats();
+    res.json(stats);
+  } catch (error) {
+    console.error('❌ Error getting ingestion stats:', error);
+    res.status(500).json({ error: 'Failed to get statistics' });
+  }
+});
+
+// Clear processed data (for testing)
+app.post('/api/foundry/clear', (req, res) => {
+  try {
+    const { external_id } = req.body;
+    clearProcessedData(external_id);
+    
+    res.json({
+      message: external_id ? 
+        `Cleared data for user: ${external_id}` : 
+        'Cleared all processed data',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('❌ Error clearing data:', error);
+    res.status(500).json({ error: 'Failed to clear data' });
+  }
 });
 
 // Catch-all for other webhook paths
