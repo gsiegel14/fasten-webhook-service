@@ -5,12 +5,17 @@ const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
 const { Webhook } = require('standardwebhooks');
+const {
+  requestEHIExport,
+  FASTEN_CONFIGURED
+} = require('./fasten-api');
 
 // Import Foundry integration
 const {
   downloadAndProcessFHIR,
   getAllFoundryData,
   getFoundryDataForUser,
+  getFoundryDataHistory,
   clearProcessedData,
   getIngestionStats
 } = require('./foundry-integration');
@@ -23,6 +28,8 @@ const PORT = process.env.PORT || 8080;
 
 // Initialize diagnostics
 const diagnostics = new WebhookDiagnostics();
+
+const pendingExportRequests = new Set();
 
 // In-memory storage for webhook events (in production, use a database)
 const webhookEvents = new Map();
@@ -345,6 +352,48 @@ async function processWebhookEvent(body, timestamp) {
   }
 }
 
+async function triggerExportForConnection(orgConnectionId, connectionData) {
+  if (pendingExportRequests.has(orgConnectionId)) {
+    console.log(`ℹ️  Export request already in-flight for ${orgConnectionId}; skipping duplicate trigger.`);
+    return;
+  }
+
+  pendingExportRequests.add(orgConnectionId);
+
+  const requestTimestamp = new Date().toISOString();
+  console.log(`🚀 Requesting Fasten EHI export for connection ${orgConnectionId} at ${requestTimestamp}`);
+
+  try {
+    const response = await requestEHIExport(orgConnectionId);
+    const responseData = response?.data || response || {};
+    const status = responseData.status || response?.status || 'requested';
+    const taskId = responseData.task_id || response?.task_id || null;
+
+    if (connectionData) {
+      connectionData.exportStatus = status;
+      connectionData.lastExportRequested = requestTimestamp;
+      if (taskId) {
+        connectionData.pendingTaskId = taskId;
+      }
+    }
+
+    console.log(`✅ Fasten export requested for ${orgConnectionId} (status: ${status}${taskId ? `, task: ${taskId}` : ''})`);
+  } catch (error) {
+    const message = error?.message || 'Unknown error';
+    console.error(`❌ Failed to request Fasten export for ${orgConnectionId}: ${message}`);
+    if (error?.body) {
+      console.error(`   ↳ Response body: ${error.body}`);
+    }
+    if (connectionData) {
+      connectionData.exportStatus = 'request_failed';
+      connectionData.exportError = message;
+      connectionData.lastExportRequested = requestTimestamp;
+    }
+  } finally {
+    pendingExportRequests.delete(orgConnectionId);
+  }
+}
+
 async function handleExportSuccess(data, timestamp) {
   const { org_connection_id, download_link, stats, task_id, org_id } = data;
   
@@ -479,9 +528,13 @@ async function handleConnectionSuccess(data, timestamp) {
     console.log(`👥 User ${external_id} now has ${userConnections.get(external_id).size} connection(s)`);
   }
   
-  // Note: Export triggering removed - Fasten handles this automatically
-  // The export will be triggered by Fasten after connection establishment
-  console.log(`📝 Connection established, awaiting Fasten to trigger export for: ${org_connection_id}`);
+  if (FASTEN_CONFIGURED) {
+    await triggerExportForConnection(org_connection_id, connectionData);
+  } else {
+    console.warn('⚠️  Fasten credentials missing; skipping automatic export request.');
+  }
+
+  console.log(`📝 Connection established for ${org_connection_id}; monitoring for export completion.`);
 }
 
 function handleAuthorizationRevoked(data, timestamp) {
@@ -561,6 +614,23 @@ app.get('/api/foundry/data', (req, res) => {
   } catch (error) {
     console.error('❌ Error serving Foundry data:', error);
     res.status(500).json({ error: 'Failed to retrieve data' });
+  }
+});
+
+app.get('/api/foundry/dataHistory', (req, res) => {
+  try {
+    const history = getFoundryDataHistory();
+    res.json({
+      data: history,
+      metadata: {
+        batches: history.length,
+        timestamp: new Date().toISOString(),
+        source: 'fasten-webhook-service'
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error serving Foundry data history:', error);
+    res.status(500).json({ error: 'Failed to retrieve data history' });
   }
 });
 
@@ -724,4 +794,3 @@ process.on('SIGINT', () => {
   console.log('SIGINT received, shutting down gracefully');
   process.exit(0);
 });
-
