@@ -92,6 +92,30 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Debug endpoint to show recent events
+app.get('/debug/events', (req, res) => {
+  console.log(`${new Date().toISOString()} - GET /debug/events`);
+  
+  const recentEvents = Array.from(webhookEvents.entries())
+    .sort((a, b) => new Date(b[1].timestamp) - new Date(a[1].timestamp))
+    .slice(0, 20)
+    .map(([id, event]) => ({
+      id,
+      timestamp: event.timestamp,
+      type: event.body?.type,
+      api_mode: event.body?.api_mode,
+      external_id: event.body?.data?.external_id,
+      org_connection_id: event.body?.data?.org_connection_id,
+      processed: event.processed
+    }));
+  
+  res.json({
+    recentEvents,
+    totalEvents: webhookEvents.size,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // API endpoint for iOS app to get connection status
 app.get('/api/connections/:orgConnectionId/status', (req, res) => {
   const { orgConnectionId } = req.params;
