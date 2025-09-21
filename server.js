@@ -4,6 +4,7 @@ const helmet = require('helmet');
 const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
+const { Webhook } = require('standardwebhooks');
 
 // Import Foundry integration
 const {
@@ -14,11 +15,18 @@ const {
   getIngestionStats
 } = require('./foundry-integration');
 
+// Import webhook diagnostics
+const WebhookDiagnostics = require('./webhook-diagnostics');
+
 const app = express();
 const PORT = process.env.PORT || 8080;
 
+// Initialize diagnostics
+const diagnostics = new WebhookDiagnostics();
+
 // In-memory storage for webhook events (in production, use a database)
 const webhookEvents = new Map();
+const processedEventIds = new Set(); // For idempotency protection
 const connectionExports = new Map(); // org_connection_id -> export data
 const connectionStatus = new Map(); // org_connection_id -> connection info
 const userConnections = new Map(); // external_id -> Set<org_connection_id>
@@ -50,44 +58,16 @@ app.use((req, res, next) => {
   next();
 });
 
-// Webhook signature verification (Standard Webhooks format)
-function verifyWebhookSignature(body, signature, secret) {
-  if (!signature || !secret) {
-    return false; // Skip verification if no signature or secret
+// Webhook signature verification using Standard-Webhooks library
+function verifyWebhookSignature(body, headers, secret) {
+  if (!secret) {
+    return false; // Skip verification if no secret
   }
   
   try {
-    const parts = signature.split(',').map(part => part.trim());
-    let timestamp = null;
-    let signatures = [];
-    
-    for (const part of parts) {
-      const [key, value] = part.split('=', 2);
-      if (key === 't') {
-        timestamp = parseInt(value);
-      } else if (key === 'v1') {
-        signatures.push(value);
-      }
-    }
-    
-    if (!timestamp || signatures.length === 0) {
-      return false;
-    }
-    
-    // Check timestamp (within 5 minutes)
-    const now = Math.floor(Date.now() / 1000);
-    if (Math.abs(now - timestamp) > 300) {
-      return false;
-    }
-    
-    // Verify signature
-    const payload = `${timestamp}.${body}`;
-    const expectedSignature = crypto.createHmac('sha256', secret).update(payload).digest('hex');
-    
-    return signatures.some(sig => crypto.timingSafeEqual(
-      Buffer.from(expectedSignature, 'hex'),
-      Buffer.from(sig, 'hex')
-    ));
+    const wh = new Webhook(secret);
+    wh.verify(body, headers);
+    return true;
   } catch (error) {
     console.error('Webhook signature verification error:', error);
     return false;
@@ -100,8 +80,10 @@ app.get('/health', (req, res) => {
     status: 'healthy', 
     timestamp: new Date().toISOString(),
     service: 'fasten-webhook-service',
+    version: '1.0.0',
     stats: {
       totalEvents: webhookEvents.size,
+      processedEvents: processedEventIds.size,
       connections: connectionStatus.size,
       exports: connectionExports.size,
       uniqueUsers: userConnections.size,
@@ -258,10 +240,9 @@ app.post('/webhook/fasten', async (req, res) => {
   console.log('Body:', JSON.stringify(req.body, null, 2));
   
   // Verify webhook signature if secret is provided
-  const signature = req.headers['webhook-signature'];
   const secret = process.env.FASTEN_WEBHOOK_SECRET;
   
-  if (secret && !verifyWebhookSignature(req.rawBody.toString(), signature, secret)) {
+  if (secret && !verifyWebhookSignature(req.rawBody, req.headers, secret)) {
     console.log('❌ Webhook signature verification failed');
     return res.status(401).json({ error: 'Invalid signature' });
   }
@@ -300,6 +281,17 @@ app.post('/webhook/fasten', async (req, res) => {
 // Process webhook events based on type
 async function processWebhookEvent(body, timestamp) {
   const { type, data, api_mode, id } = body;
+  
+  // Check for duplicate events (idempotency protection)
+  if (id && processedEventIds.has(id)) {
+    console.log(`⚠️ Duplicate event detected: ${id} - skipping processing`);
+    return;
+  }
+  
+  // Mark event as processed
+  if (id) {
+    processedEventIds.add(id);
+  }
   
   console.log(`📋 Processing event: ${type} (${api_mode || 'unknown mode'})`);
   
@@ -349,6 +341,9 @@ async function handleExportSuccess(data, timestamp) {
   // Store export data for iOS app to retrieve
   connectionExports.set(org_connection_id, exportData);
   
+  // Stop export monitoring (export received successfully)
+  diagnostics.stopExportMonitoring(org_connection_id);
+
   // Update connection status
   if (connectionStatus.has(org_connection_id)) {
     const connection = connectionStatus.get(org_connection_id);
@@ -385,6 +380,9 @@ function handleExportFailed(data, timestamp) {
   
   console.log(`❌ Export Failed for connection: ${org_connection_id}`);
   console.log(`💥 Failure reason: ${failure_reason}`);
+  
+  // Stop export monitoring (failure received)
+  diagnostics.stopExportMonitoring(org_connection_id);
   
   const exportData = {
     status: 'failed',
@@ -443,6 +441,9 @@ function handleConnectionSuccess(data, timestamp) {
   };
   
   connectionStatus.set(org_connection_id, connectionData);
+  
+  // Start export timeout monitoring
+  diagnostics.startExportMonitoring(org_connection_id, connectionData);
   
   // Update user-centric connection tracking
   if (external_id) {
@@ -581,6 +582,64 @@ app.post('/api/foundry/clear', (req, res) => {
   } catch (error) {
     console.error('❌ Error clearing data:', error);
     res.status(500).json({ error: 'Failed to clear data' });
+  }
+});
+
+// Webhook Diagnostics Endpoints
+app.get('/api/diagnostics/report', (req, res) => {
+  try {
+    const report = diagnostics.generateDiagnosticReport();
+    res.json(report);
+  } catch (error) {
+    console.error('Error generating diagnostic report:', error);
+    res.status(500).json({ error: 'Failed to generate report' });
+  }
+});
+
+app.get('/api/diagnostics/stats', (req, res) => {
+  try {
+    const stats = diagnostics.getStats();
+    res.json(stats);
+  } catch (error) {
+    console.error('Error getting diagnostic stats:', error);
+    res.status(500).json({ error: 'Failed to get stats' });
+  }
+});
+
+// Enhanced connection status with timeout info
+app.get('/api/connections/detailed', (req, res) => {
+  try {
+    const connections = [];
+    const diagnosticStats = diagnostics.getStats();
+    
+    for (const [orgConnectionId, connection] of connectionStatus.entries()) {
+      const enhanced = {
+        ...connection,
+        orgConnectionId,
+        hasExport: connectionExports.has(orgConnectionId)
+      };
+      
+      // Add timeout monitoring info if available
+      const timeout = diagnostics.connectionTimeouts?.get(orgConnectionId);
+      if (timeout) {
+        enhanced.monitoring = {
+          status: timeout.status,
+          startedAt: timeout.startedAt,
+          timedOutAt: timeout.timedOutAt
+        };
+      }
+      
+      connections.push(enhanced);
+    }
+    
+    res.json({
+      connections,
+      diagnostics: diagnosticStats,
+      totalConnections: connections.length
+    });
+  } catch (error) {
+    console.error('Error getting detailed connections:', error);
+    res.status(500).json({ error: 'Failed to get connections' });
   }
 });
 

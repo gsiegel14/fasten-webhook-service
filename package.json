@@ -11,7 +11,8 @@
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "helmet": "^7.1.0",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "standardwebhooks": "^1.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
