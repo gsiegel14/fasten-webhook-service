@@ -1,9 +1,19 @@
 // Foundry Integration Module for Fasten Webhook Service
 const fs = require('fs').promises;
 const path = require('path');
+const {
+  authorizedFastenFetch,
+  FASTEN_CONFIGURED
+} = require('./fasten-api');
+
+// Access environment variables for direct authentication
+const FASTEN_PUBLIC_KEY = process.env.FASTEN_PUBLIC_KEY;
+const FASTEN_PRIVATE_KEY = process.env.FASTEN_PRIVATE_KEY;
 
 // In-memory storage for processed FHIR data (replace with database in production)
 const foundryDataStore = new Map(); // user_id -> Array<FoundryRecord>
+const ingestionHistory = []; // chronological list of ingested batches
+const HISTORY_LIMIT = 100;
 
 // Simplified: No complex mappings needed - just pass through raw FHIR
 
@@ -12,13 +22,30 @@ const foundryDataStore = new Map(); // user_id -> Array<FoundryRecord>
  */
 async function downloadAndProcessFHIR(downloadLink, orgConnectionId, externalId) {
   try {
+    if (!FASTEN_CONFIGURED) {
+      throw new Error('Fasten credentials are not configured; cannot download FHIR data.');
+    }
+
     console.log(`📥 Downloading FHIR data from: ${downloadLink}`);
     
-    const response = await fetch(downloadLink);
-    if (!response.ok) {
-      throw new Error(`Failed to download FHIR data: ${response.statusText}`);
-    }
+    // Use direct fetch for download URLs since they're already complete URLs
+    // and may have different authentication requirements
+    const auth = Buffer.from(`${FASTEN_PUBLIC_KEY}:${FASTEN_PRIVATE_KEY}`).toString('base64');
     
+    const response = await fetch(downloadLink, {
+      method: 'GET',
+      headers: { 
+        'Accept': 'application/jsonl',
+        'Authorization': `Basic ${auth}`
+      }
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => '');
+      console.error(`❌ Download failed with status ${response.status}: ${errorText}`);
+      throw new Error(`Failed to download FHIR data: ${response.status} ${response.statusText}`);
+    }
+
     const jsonlContent = await response.text();
     console.log(`📄 Downloaded ${jsonlContent.length} characters of FHIR data`);
     
@@ -42,10 +69,10 @@ async function downloadAndProcessFHIR(downloadLink, orgConnectionId, externalId)
     const foundryRecords = transformForFoundry(fhirResources, orgConnectionId, externalId);
     
     // Store for Foundry to pull
-    await storeForFoundryIngestion(externalId, foundryRecords);
-    
+    await storeForFoundryIngestion(externalId, orgConnectionId, foundryRecords, jsonlContent);
+
     return foundryRecords;
-    
+
   } catch (error) {
     console.error('❌ Error processing FHIR data:', error);
     throw error;
@@ -88,23 +115,37 @@ function transformForFoundry(fhirResources, orgConnectionId, externalId) {
 /**
  * Store processed data for Foundry ingestion
  */
-async function storeForFoundryIngestion(externalId, foundryRecords) {
+async function storeForFoundryIngestion(externalId, orgConnectionId, foundryRecords, rawPayload = null) {
   if (!foundryDataStore.has(externalId)) {
     foundryDataStore.set(externalId, []);
   }
   
   const userRecords = foundryDataStore.get(externalId);
   userRecords.push(...foundryRecords);
-  
+
   console.log(`💾 Stored ${foundryRecords.length} records for user ${externalId}`);
   console.log(`📊 Total records for user: ${userRecords.length}`);
-  
+
   // Log resource type breakdown
   const resourceTypes = {};
   foundryRecords.forEach(record => {
     resourceTypes[record.resource_type] = (resourceTypes[record.resource_type] || 0) + 1;
   });
   console.log(`📋 Resource types processed:`, resourceTypes);
+
+  const batchSnapshot = {
+    external_id: externalId,
+    org_connection_id: orgConnectionId,
+    ingested_at: new Date().toISOString(),
+    record_count: foundryRecords.length,
+    resource_types: resourceTypes,
+    raw_payload_preview: rawPayload ? rawPayload.slice(0, 2048) : null
+  };
+
+  ingestionHistory.push(batchSnapshot);
+  if (ingestionHistory.length > HISTORY_LIMIT) {
+    ingestionHistory.splice(0, ingestionHistory.length - HISTORY_LIMIT);
+  }
 }
 
 /**
@@ -127,15 +168,25 @@ function getFoundryDataForUser(externalId) {
   return foundryDataStore.get(externalId) || [];
 }
 
+function getFoundryDataHistory() {
+  return [...ingestionHistory];
+}
+
 /**
  * Clear processed data after successful Foundry ingestion
  */
 function clearProcessedData(externalId = null) {
   if (externalId) {
     foundryDataStore.delete(externalId);
+    for (let index = ingestionHistory.length - 1; index >= 0; index -= 1) {
+      if (ingestionHistory[index].external_id === externalId) {
+        ingestionHistory.splice(index, 1);
+      }
+    }
     console.log(`🧹 Cleared data for user: ${externalId}`);
   } else {
     foundryDataStore.clear();
+    ingestionHistory.length = 0;
     console.log(`🧹 Cleared all processed data`);
   }
 }
@@ -161,6 +212,7 @@ function getIngestionStats() {
     totalUsers,
     totalRecords,
     resourceTypeCounts,
+    historyBatches: ingestionHistory.length,
     lastUpdated: new Date().toISOString()
   };
 }
@@ -171,6 +223,7 @@ module.exports = {
   storeForFoundryIngestion,
   getAllFoundryData,
   getFoundryDataForUser,
+  getFoundryDataHistory,
   clearProcessedData,
   getIngestionStats
 };
