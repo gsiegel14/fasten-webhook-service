@@ -455,37 +455,9 @@ async function handleConnectionSuccess(data, timestamp) {
     console.log(`👥 User ${external_id} now has ${userConnections.get(external_id).size} connection(s)`);
   }
   
-  // CRITICAL: Trigger the export after successful connection
-  console.log(`🚀 Triggering export for connection: ${org_connection_id}`);
-  try {
-    const axios = require('axios');
-    const fastenPublicKey = process.env.FASTEN_PUBLIC_KEY;
-    const fastenPrivateKey = process.env.FASTEN_PRIVATE_KEY;
-    
-    if (!fastenPublicKey || !fastenPrivateKey) {
-      console.error('❌ Cannot trigger export: FASTEN_PUBLIC_KEY or FASTEN_PRIVATE_KEY not configured');
-      return;
-    }
-    
-    const credentials = Buffer.from(`${fastenPublicKey}:${fastenPrivateKey}`).toString('base64');
-    const exportResponse = await axios.post(
-      'https://api.connect.fastenhealth.com/v1/bridge/fhir/ehi-export',
-      { org_connection_id: org_connection_id },
-      {
-        headers: {
-          'Authorization': `Basic ${credentials}`,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-    
-    console.log(`✅ Export triggered successfully for ${org_connection_id}:`, exportResponse.data);
-    connectionData.exportTriggered = true;
-    connectionData.exportTriggeredAt = new Date().toISOString();
-  } catch (error) {
-    console.error(`❌ Failed to trigger export for ${org_connection_id}:`, error.response?.data || error.message);
-    connectionData.exportTriggerError = error.message;
-  }
+  // Note: Export triggering removed - Fasten handles this automatically
+  // The export will be triggered by Fasten after connection establishment
+  console.log(`📝 Connection established, awaiting Fasten to trigger export for: ${org_connection_id}`);
 }
 
 function handleAuthorizationRevoked(data, timestamp) {
