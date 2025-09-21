@@ -148,10 +148,55 @@ app.get('/api/connections/:orgConnectionId/status', (req, res) => {
     });
   }
   
+  // Get export data
+  const exportData = connectionExports.get(orgConnectionId);
+  const foundryData = getAllFoundryData();
+  const connectionRecords = foundryData.filter(r => r.orgConnectionId === orgConnectionId);
+  
+  // Determine detailed export status
+  let exportStatus = 'pending';
+  let error = null;
+  let recordCount = 0;
+  
+  if (exportData) {
+    if (exportData.downloadLink) {
+      recordCount = connectionRecords.length;
+      if (recordCount > 0) {
+        exportStatus = 'complete';
+      } else {
+        exportStatus = 'processing';
+      }
+    } else if (exportData.taskId) {
+      exportStatus = 'downloading';
+    } else if (exportData.exportStatus === 'error' || exportData.error) {
+      exportStatus = 'error';
+      error = exportData.error || 'Export failed';
+    } else {
+      exportStatus = 'requested';
+    }
+  } else if (connection.exportStatus === 'requested' || connection.pendingTaskId) {
+    exportStatus = 'requested';
+  }
+  
+  // Check if export is in flight
+  if (inFlightExports && inFlightExports.has && inFlightExports.has(orgConnectionId)) {
+    exportStatus = 'in_progress';
+  }
+  
   res.json({
     orgConnectionId,
     ...connection,
-    hasExport: connectionExports.has(orgConnectionId)
+    hasExport: connectionExports.has(orgConnectionId),
+    exportStatus,
+    dataReady: recordCount > 0,
+    recordCount,
+    exportData: exportData ? {
+      taskId: exportData.taskId,
+      downloadLink: exportData.downloadLink,
+      totalResources: exportData.totalResources,
+      timestamp: exportData.timestamp
+    } : null,
+    error
   });
 });
 
