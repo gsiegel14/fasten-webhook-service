@@ -20,6 +20,19 @@ const {
   getIngestionStats
 } = require('./foundry-integration');
 
+// Import performance optimizations
+const {
+  OPTIMIZATION_CONFIG,
+  PerformanceMonitor,
+  optimizedTriggerExport,
+  optimizedProcessFHIR,
+  FoundryCache
+} = require('./performance-optimizations');
+
+// Initialize performance monitoring
+const perfMonitor = new PerformanceMonitor();
+const foundryCache = new FoundryCache();
+
 // Import webhook diagnostics
 const WebhookDiagnostics = require('./webhook-diagnostics');
 
@@ -600,15 +613,26 @@ app.post('/webhook/test', (req, res) => {
 // This endpoint is called BY Foundry to pull processed FHIR data
 app.get('/api/foundry/data', (req, res) => {
   try {
-    const allData = getAllFoundryData();
-    console.log(`📤 Foundry data request: returning ${allData.length} records`);
+    // Check cache first for faster response
+    const cacheKey = 'foundry-data-all';
+    let allData = foundryCache.get(cacheKey);
+    
+    if (!allData) {
+      // Cache miss - get fresh data
+      allData = getAllFoundryData();
+      foundryCache.set(cacheKey, allData);
+      console.log(`📤 Foundry data request: returning ${allData.length} records (fresh)`);
+    } else {
+      console.log(`⚡ Foundry data request: returning ${allData.length} records (cached)`);
+    }
     
     res.json({
       data: allData,
       metadata: {
         total_records: allData.length,
         timestamp: new Date().toISOString(),
-        source: 'fasten-webhook-service'
+        source: 'fasten-webhook-service',
+        cached: allData === foundryCache.get(cacheKey)
       }
     });
   } catch (error) {
@@ -662,6 +686,27 @@ app.get('/api/foundry/stats', (req, res) => {
   } catch (error) {
     console.error('❌ Error getting ingestion stats:', error);
     res.status(500).json({ error: 'Failed to get statistics' });
+  }
+});
+
+// Get performance metrics
+app.get('/api/performance/metrics', (req, res) => {
+  try {
+    const metrics = perfMonitor.getMetricsSummary();
+    const cacheStatus = {
+      enabled: OPTIMIZATION_CONFIG.foundry.cacheEnabled,
+      ttlMs: OPTIMIZATION_CONFIG.foundry.cacheTTLMs
+    };
+    
+    res.json({
+      metrics,
+      optimizations: OPTIMIZATION_CONFIG,
+      cacheStatus,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('❌ Error getting performance metrics:', error);
+    res.status(500).json({ error: 'Failed to get performance metrics' });
   }
 });
 
