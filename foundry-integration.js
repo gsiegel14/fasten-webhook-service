@@ -146,6 +146,12 @@ async function storeForFoundryIngestion(externalId, orgConnectionId, foundryReco
   if (ingestionHistory.length > HISTORY_LIMIT) {
     ingestionHistory.splice(0, ingestionHistory.length - HISTORY_LIMIT);
   }
+
+  // Notify that cache should be invalidated
+  if (typeof global !== 'undefined' && global.foundryCache) {
+    global.foundryCache.clear();
+    console.log(`🧹 Invalidated Foundry cache due to new data ingestion`);
+  }
 }
 
 /**

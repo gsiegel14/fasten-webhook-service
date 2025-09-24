@@ -33,6 +33,9 @@ const {
 const perfMonitor = new PerformanceMonitor();
 const foundryCache = new FoundryCache();
 
+// Make foundryCache available globally for cache invalidation
+global.foundryCache = foundryCache;
+
 // Import webhook diagnostics
 const WebhookDiagnostics = require('./webhook-diagnostics');
 
