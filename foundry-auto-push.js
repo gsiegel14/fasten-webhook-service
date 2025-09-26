@@ -3,54 +3,124 @@
 
 const BACKEND_PROXY_URL = 'https://atlas-backend-proxy.onrender.com';
 
+// Target dataset RID for Fasten FHIR data ingestion
+const FASTEN_FHIR_DATASET_RID = 'ri.foundry.main.dataset.3a90fb2b-7e9a-4a03-94b0-30839be53091';
+
 /**
- * Automatically push FHIR data to Foundry via backend proxy
+ * Push Fasten FHIR data directly to Foundry dataset
+ * This is separate from HealthKit data and goes to a different dataset
  */
-async function pushToFoundryAutomatic(fhirRecords, externalId, orgConnectionId) {
+async function pushFastenFHIRToFoundry(fhirRecords, externalId, orgConnectionId) {
   try {
-    console.log(`🚀 Auto-pushing ${fhirRecords.length} FHIR records to Foundry...`);
+    console.log(`🚀 Pushing ${fhirRecords.length} Fasten FHIR records to dataset ${FASTEN_FHIR_DATASET_RID}...`);
     
-    // Transform data for HealthKit action format
+    // Transform FHIR records for dataset ingestion
+    const datasetRecords = fhirRecords.map(record => ({
+      // User identification
+      auth0_user_id: externalId,
+      org_connection_id: orgConnectionId,
+      
+      // FHIR data
+      fhir_resource: record.fhir_resource || record,
+      resource_type: record.resource_type || record.fhir_resource?.resourceType,
+      resource_id: record.resource_id || record.fhir_resource?.id,
+      
+      // Metadata
+      ingested_at: new Date().toISOString(),
+      source: 'fasten-connect',
+      
+      // Additional fields for analysis
+      patient_id: extractPatientId(record),
+      encounter_id: extractEncounterId(record),
+      provider_org: extractProviderOrg(record)
+    }));
+
+    // Create payload for dataset ingestion
     const payload = {
-      auth0id: externalId,
-      rawhealthkit: Buffer.from(JSON.stringify(fhirRecords)).toString('base64'),
-      timestamp: new Date().toISOString(),
-      device: 'fasten-webhook-auto',
-      recordCount: fhirRecords.length,
-      manifest: {
-        ingestionRunId: `fasten-auto-${Date.now()}`,
-        anchorTimestamp: new Date().toISOString(),
-        source: 'fasten-connect-auto',
-        orgConnectionId: orgConnectionId,
-        externalId: externalId
+      dataset_rid: FASTEN_FHIR_DATASET_RID,
+      records: datasetRecords,
+      metadata: {
+        ingestion_run_id: `fasten-fhir-${Date.now()}`,
+        total_records: datasetRecords.length,
+        user_id: externalId,
+        connection_id: orgConnectionId,
+        timestamp: new Date().toISOString()
       }
     };
 
-    // Push to backend proxy's HealthKit endpoint
-    const response = await fetch(`${BACKEND_PROXY_URL}/api/v1/healthkit/export`, {
+    // TODO: This endpoint needs to be created in backend-proxy
+    // For now, we'll use the generic Foundry action endpoint
+    const response = await fetch(`${BACKEND_PROXY_URL}/api/v1/foundry/datasets/ingest`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        // Note: Backend proxy will need to accept service-to-service calls
-        // or we need to add authentication here
       },
       body: JSON.stringify(payload)
     });
 
     if (response.ok) {
       const result = await response.json();
-      console.log('✅ Successfully auto-pushed to Foundry via backend proxy');
+      console.log(`✅ Successfully pushed Fasten FHIR data to dataset ${FASTEN_FHIR_DATASET_RID}`);
       console.log('📊 Foundry response:', result);
-      return { success: true, result };
+      return { success: true, result, datasetRid: FASTEN_FHIR_DATASET_RID };
     } else {
       const errorText = await response.text();
-      console.error('❌ Backend proxy push failed:', response.status, errorText);
+      console.error('❌ Fasten FHIR dataset push failed:', response.status, errorText);
       return { success: false, error: `HTTP ${response.status}: ${errorText}` };
     }
   } catch (error) {
-    console.error('❌ Error auto-pushing to backend proxy:', error);
+    console.error('❌ Error pushing Fasten FHIR to Foundry:', error);
     return { success: false, error: error.message };
   }
+}
+
+// Helper functions to extract key fields from FHIR resources
+function extractPatientId(record) {
+  const resource = record.fhir_resource || record;
+  if (resource.subject?.reference) {
+    return resource.subject.reference.replace('Patient/', '');
+  }
+  if (resource.patient?.reference) {
+    return resource.patient.reference.replace('Patient/', '');
+  }
+  if (resource.resourceType === 'Patient') {
+    return resource.id;
+  }
+  return null;
+}
+
+function extractEncounterId(record) {
+  const resource = record.fhir_resource || record;
+  if (resource.encounter?.reference) {
+    return resource.encounter.reference.replace('Encounter/', '');
+  }
+  if (resource.resourceType === 'Encounter') {
+    return resource.id;
+  }
+  return null;
+}
+
+function extractProviderOrg(record) {
+  const resource = record.fhir_resource || record;
+  if (resource.performer?.[0]?.reference) {
+    return resource.performer[0].reference;
+  }
+  if (resource.organization?.reference) {
+    return resource.organization.reference;
+  }
+  if (resource.resourceType === 'Organization') {
+    return resource.name || resource.id;
+  }
+  return null;
+}
+
+/**
+ * DEPRECATED: This was using HealthKit endpoint incorrectly
+ * Use pushFastenFHIRToFoundry instead
+ */
+async function pushToFoundryAutomatic(fhirRecords, externalId, orgConnectionId) {
+  console.log('⚠️ DEPRECATED: pushToFoundryAutomatic uses HealthKit endpoint. Using pushFastenFHIRToFoundry instead.');
+  return pushFastenFHIRToFoundry(fhirRecords, externalId, orgConnectionId);
 }
 
 /**
@@ -92,19 +162,21 @@ async function pushViaFoundryAction(fhirRecords, externalId, orgConnectionId) {
 
 /**
  * Smart push - tries multiple methods for reliability
+ * Now correctly uses Fasten FHIR dataset for Fasten data
  */
 async function smartPushToFoundry(fhirRecords, externalId, orgConnectionId) {
-  console.log(`🧠 Smart push: ${fhirRecords.length} records for user ${externalId}`);
+  console.log(`🧠 Smart push: ${fhirRecords.length} Fasten FHIR records for user ${externalId}`);
+  console.log(`📊 Target dataset: ${FASTEN_FHIR_DATASET_RID}`);
   
-  // Try method 1: HealthKit export endpoint
-  let result = await pushToFoundryAutomatic(fhirRecords, externalId, orgConnectionId);
+  // Primary method: Push to Fasten FHIR dataset
+  let result = await pushFastenFHIRToFoundry(fhirRecords, externalId, orgConnectionId);
   if (result.success) {
     return result;
   }
   
-  console.log('⚠️ Method 1 failed, trying Foundry action...');
+  console.log('⚠️ Fasten FHIR push failed, trying alternative method...');
   
-  // Try method 2: Direct Foundry action
+  // Fallback: Try via Foundry action (may need to be configured)
   result = await pushViaFoundryAction(fhirRecords, externalId, orgConnectionId);
   if (result.success) {
     return result;
@@ -115,7 +187,9 @@ async function smartPushToFoundry(fhirRecords, externalId, orgConnectionId) {
 }
 
 module.exports = {
-  pushToFoundryAutomatic,
-  pushViaFoundryAction,
-  smartPushToFoundry
+  pushFastenFHIRToFoundry,  // Primary method for Fasten FHIR data
+  pushToFoundryAutomatic,    // Deprecated - was using HealthKit endpoint
+  pushViaFoundryAction,      // Fallback method
+  smartPushToFoundry,        // Smart router that tries multiple methods
+  FASTEN_FHIR_DATASET_RID   // Export the dataset RID for reference
 };
