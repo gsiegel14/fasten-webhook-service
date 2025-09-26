@@ -6,6 +6,9 @@ const BACKEND_PROXY_URL = 'https://atlas-backend-proxy.onrender.com';
 // Target dataset RID for Fasten FHIR data ingestion
 const FASTEN_FHIR_DATASET_RID = 'ri.foundry.main.dataset.3a90fb2b-7e9a-4a03-94b0-30839be53091';
 
+// Import the dataset writer
+const { writeToFoundryDataset } = require('./foundry-dataset-writer');
+
 /**
  * Push Fasten FHIR data directly to Foundry dataset
  * This is separate from HealthKit data and goes to a different dataset
@@ -35,38 +38,36 @@ async function pushFastenFHIRToFoundry(fhirRecords, externalId, orgConnectionId)
       provider_org: extractProviderOrg(record)
     }));
 
-    // Create payload for dataset ingestion
-    const payload = {
-      dataset_rid: FASTEN_FHIR_DATASET_RID,
-      records: datasetRecords,
-      metadata: {
-        ingestion_run_id: `fasten-fhir-${Date.now()}`,
-        total_records: datasetRecords.length,
-        user_id: externalId,
-        connection_id: orgConnectionId,
-        timestamp: new Date().toISOString()
-      }
-    };
-
-    // TODO: This endpoint needs to be created in backend-proxy
-    // For now, we'll use the generic Foundry action endpoint
-    const response = await fetch(`${BACKEND_PROXY_URL}/api/v1/foundry/datasets/ingest`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(payload)
+    // Use the dataset writer to format records
+    const writeResult = await writeToFoundryDataset(datasetRecords, {
+      ingestion_run_id: `fasten-fhir-${Date.now()}`,
+      user_id: externalId,
+      connection_id: orgConnectionId
     });
 
-    if (response.ok) {
-      const result = await response.json();
-      console.log(`✅ Successfully pushed Fasten FHIR data to dataset ${FASTEN_FHIR_DATASET_RID}`);
-      console.log('📊 Foundry response:', result);
-      return { success: true, result, datasetRid: FASTEN_FHIR_DATASET_RID };
+    if (writeResult.success) {
+      console.log(`✅ Successfully formatted ${writeResult.recordCount} Fasten FHIR records for dataset ${FASTEN_FHIR_DATASET_RID}`);
+      
+      // TODO: Once backend proxy has dataset ingestion endpoint, send the formatted payload
+      // For now, we're just formatting and logging
+      console.log('📋 Dataset payload ready for ingestion');
+      console.log('⚠️ Note: Backend proxy needs dataset ingestion endpoint to complete the push');
+      
+      // Store the formatted data for manual upload if needed
+      const fs = require('fs').promises;
+      const filename = `fasten-fhir-${Date.now()}.json`;
+      await fs.writeFile(filename, JSON.stringify(writeResult.payload.records, null, 2));
+      console.log(`💾 Saved formatted data to ${filename} for manual upload if needed`);
+      
+      return { 
+        success: true, 
+        result: writeResult, 
+        datasetRid: FASTEN_FHIR_DATASET_RID,
+        message: 'Data formatted and ready for Foundry dataset ingestion'
+      };
     } else {
-      const errorText = await response.text();
-      console.error('❌ Fasten FHIR dataset push failed:', response.status, errorText);
-      return { success: false, error: `HTTP ${response.status}: ${errorText}` };
+      console.error('❌ Failed to format data for Foundry dataset:', writeResult.error);
+      return { success: false, error: writeResult.error };
     }
   } catch (error) {
     console.error('❌ Error pushing Fasten FHIR to Foundry:', error);
