@@ -20,6 +20,11 @@ const {
   getIngestionStats
 } = require('./foundry-integration');
 
+// Import auto-push functionality
+const {
+  smartPushToFoundry
+} = require('./foundry-auto-push');
+
 // Import performance optimizations
 const {
   OPTIMIZATION_CONFIG,
@@ -499,8 +504,20 @@ async function handleExportSuccess(data, timestamp) {
     const connection = connectionStatus.get(org_connection_id);
     if (connection && connection.externalId) {
       console.log(`🔄 Processing FHIR data for Foundry ingestion...`);
-      await downloadAndProcessFHIR(download_link, org_connection_id, connection.externalId);
-      console.log(`✅ FHIR data processed and ready for Foundry ingestion`);
+      
+      // Download and process FHIR data
+      const foundryRecords = await downloadAndProcessFHIR(download_link, org_connection_id, connection.externalId);
+      console.log(`✅ FHIR data processed: ${foundryRecords.length} records`);
+      
+      // 🚀 NEW: Automatically push to Foundry via backend proxy
+      console.log(`🚀 Auto-pushing to Foundry...`);
+      const pushResult = await smartPushToFoundry(foundryRecords, connection.externalId, org_connection_id);
+      
+      if (pushResult.success) {
+        console.log(`✅ Successfully auto-pushed ${foundryRecords.length} records to Foundry!`);
+      } else {
+        console.error(`❌ Auto-push to Foundry failed: ${pushResult.error}`);
+      }
     } else {
       console.log(`⚠️ No external_id found for connection ${org_connection_id}, skipping Foundry processing`);
     }
